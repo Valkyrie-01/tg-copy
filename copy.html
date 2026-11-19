@@ -24,6 +24,11 @@
   text/plain с апострофом впереди (Sheets его не показывает), в text/html атрибутом
   data-sheets-value с типом «строка» (так кладёт в буфер сама Google-таблица).
   Собирает адрес team_bot/copy_link.py; тест распаковки — tools/tests/test_team_bot_copy_link.py.
+
+  Режим «текст вебу» (m=t рядом с d): в адресе не строки, а готовое сообщение вебу из бота
+  (кнопки «📋 Вебу» / «📋 Вебу фул» под ответом рекла). Ссылки в нём — markdown [имя](https://…).
+  В буфер: text/html с <a href> (Telegram на Маке при вставке сохраняет ссылку в имени —
+  проверено 19.11.26) и text/plain с именем без адреса. Ссылка берётся только https://.
 -->
 <html lang="ru">
 <head>
@@ -46,21 +51,26 @@
   .wrap { overflow-x: auto; margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; }
   table { border-collapse: collapse; font-size: 12px; white-space: nowrap; }
   td { border: 1px solid var(--line); padding: 4px 6px; }
+  .msg { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+         white-space: pre-wrap; word-break: break-word; }
+  .msg a { color: var(--tg-theme-link-color, var(--accent)); }
   .hint { color: var(--tg-theme-hint-color, var(--muted)); font-size: 13px; margin-top: 10px; }
 </style>
 </head>
 <body>
 <div id="status">Готовлю строки…</div>
 <button id="copy" type="button">📋 Скопировать</button>
-<div class="wrap"><table id="rows"></table></div>
-<div class="hint">Вставь в ячейку A своей таблицы — строки лягут по колонкам.</div>
+<div class="wrap" id="wrap"><table id="rows"></table></div>
+<div class="msg" id="msg" hidden></div>
+<div class="hint" id="hint">Вставь в ячейку A своей таблицы — строки лягут по колонкам.</div>
 <script>
 "use strict";
 const tg = window.Telegram && window.Telegram.WebApp;
 const statusEl = document.getElementById("status");
 const button = document.getElementById("copy");
 const tableEl = document.getElementById("rows");
-let TEXT = "", HTML = "", N = 0;
+let TEXT = "", HTML = "", N = 0, MODE = "rows";
+const msgEl = document.getElementById("msg");
 
 function say(text, cls) { statusEl.textContent = text; statusEl.className = cls || ""; }
 
@@ -223,9 +233,31 @@ function render(text) {
   tableEl.innerHTML = rows.map((r) => "<tr>" + r.map((c) => "<td>" + esc(c) + "</td>").join("") + "</tr>").join("");
 }
 
+// Текст вебу: [имя](https://…) → <a>, переносы → <br>; в text/plain — имя без адреса.
+const MD_LINK = /\[([^\]\n]+)\]\((https:\/\/[^\s)]+)\)/g;
+
+function renderText(text) {
+  if (text.length > MAX_OUT) throw new Error("текст больше предела");
+  MODE = "text";
+  TEXT = text.replace(MD_LINK, "$1");
+  let html = "", last = 0;
+  for (const m of text.matchAll(MD_LINK)) {
+    html += esc(text.slice(last, m.index)) + '<a href="' + esc(m[2]) + '">' + esc(m[1]) + "</a>";
+    last = m.index + m[0].length;
+  }
+  html += esc(text.slice(last));
+  HTML = html.replace(/\n/g, "<br>");
+  msgEl.innerHTML = HTML;
+  msgEl.hidden = false;
+  document.getElementById("wrap").hidden = true;
+  document.getElementById("hint").textContent = "Вставь в чат с вебом — ссылка в имени оффера сохранится.";
+  document.title = "Текст вебу";
+}
+
 function done(how) {
-  say("✅ Скопировано: " + N + " " + (N === 1 ? "строка" : N < 5 ? "строки" : "строк") +
-      ". Вставь в ячейку A таблицы.", "ok");
+  if (MODE === "text") say("✅ Скопировано. Вставь в чат с вебом.", "ok");
+  else say("✅ Скопировано: " + N + " " + (N === 1 ? "строка" : N < 5 ? "строки" : "строк") +
+           ". Вставь в ячейку A таблицы.", "ok");
   button.style.display = "none";
   document.body.dataset.copied = how;
   if (tg && tg.initData) setTimeout(() => tg.close(), 900);
@@ -258,7 +290,7 @@ function viaCopyEvent() {
 
 function viaSelection() {
   const range = document.createRange();
-  range.selectNodeContents(tableEl);
+  range.selectNodeContents(MODE === "text" ? msgEl : tableEl);
   const sel = window.getSelection();
   sel.removeAllRanges(); sel.addRange(range);
   if (!document.execCommand("copy")) throw new Error("execCommand отказал");
@@ -268,23 +300,29 @@ async function onButton() {
   try { await viaClipboardApi(); return done("clipboard"); } catch (e) { /* дальше */ }
   try { viaCopyEvent(); return done("copy-event"); } catch (e) { /* дальше */ }
   try { viaSelection(); return done("selection"); } catch (e) { /* дальше */ }
-  say("Не получилось скопировать автоматически: выдели таблицу ниже и скопируй вручную.", "err");
+  say("Не получилось скопировать автоматически: выдели " + (MODE === "text" ? "текст" : "таблицу") +
+      " ниже и скопируй вручную.", "err");
 }
 
 async function main() {
   if (tg) { tg.ready(); tg.expand(); }
   // Обычная ссылка — данные во фрагменте (#d=…, серверу не уходят); Mini App — в ?d=.
-  const param = new URLSearchParams(location.hash.slice(1)).get("d") ||
-                new URLSearchParams(location.search).get("d");
-  if (!param) return say("В ссылке нет строк — открой кнопку из ответа бота ещё раз.", "err");
-  try { render(await unpack(param)); } catch (e) { return say("Строки не распаковались: " + e.message, "err"); }
+  const hp = new URLSearchParams(location.hash.slice(1)), qp = new URLSearchParams(location.search);
+  const param = hp.get("d") || qp.get("d");
+  const mode = hp.get("d") ? hp.get("m") : qp.get("m");
+  if (!param) return say("В ссылке нет данных — открой кнопку из ответа бота ещё раз.", "err");
+  try {
+    const raw = await unpack(param);
+    if (mode === "t") renderText(raw); else render(raw);
+  } catch (e) { return say("Данные не распаковались: " + e.message, "err"); }
   button.addEventListener("click", onButton);
   try { await viaClipboardApi(); return done("clipboard-auto"); } catch (e) { /* нужен жест */ }
-  say("Нажми, чтобы скопировать " + N + " " + (N === 1 ? "строку" : N < 5 ? "строки" : "строк") + ":");
+  say(MODE === "text" ? "Нажми, чтобы скопировать текст вебу:" :
+      "Нажми, чтобы скопировать " + N + " " + (N === 1 ? "строку" : N < 5 ? "строки" : "строк") + ":");
   button.style.display = "block";
 }
 
-window.__copyPage = { inflateRaw, unpack, render, plainCell, htmlCell,
+window.__copyPage = { inflateRaw, unpack, render, renderText, plainCell, htmlCell,
                       get TEXT() { return TEXT; }, get HTML() { return HTML; } };
 main();
 </script>
