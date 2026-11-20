@@ -29,13 +29,23 @@
   (кнопки «📋 Вебу» / «📋 Вебу фул» под ответом рекла). Ссылки в нём — markdown [имя](https://…).
   В буфер: text/html с <a href> (Telegram на Маке при вставке сохраняет ссылку в имени —
   проверено 19.11.26) и text/plain с именем без адреса. Ссылка берётся только https://.
+
+  Окно — на один показ. Telegram (и Desktop, и клиент для Mac) держит webview бота после
+  закрытия или сворачивания и при нажатии другой кнопки того же бота может сначала показать
+  прошлую страницу: менеджер видит чужие строки или текст другого оффера и рискует скопировать
+  их. Поэтому внутри Telegram страница убирает данные с экрана, как только они больше не нужны:
+  после копирования (остаётся «Скопировано», через 0,9 с — пустой экран и close), при
+  сворачивании или уходе в фон (deactivated, visibilitychange, pagehide — тут же и close).
+  Окно развернули обратно или вернули из кэша страниц — данных уже нет, надпись «нажми
+  кнопку в чате ещё раз» и close. Скрипт Telegram грузится async: страница рисуется, не дожидаясь
+  telegram.org, и прошлый кадр висит на экране меньше.
 -->
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Скопировать строки</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script id="tgjs" async src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --accent: #2481cc; --ok: #1a7f37; }
   @media (prefers-color-scheme: dark) {
@@ -65,7 +75,20 @@
 <div class="hint" id="hint">Вставь в ячейку A своей таблицы — строки лягут по колонкам.</div>
 <script>
 "use strict";
-const tg = window.Telegram && window.Telegram.WebApp;
+// Скрипт Telegram грузится async: WebApp появляется позже страницы. withTg(fn) — сразу, если
+// он уже есть, иначе после загрузки; inTelegram() — открыто ли как Mini App (initData есть).
+let tg = null;
+const tgQueue = [];
+function tgLoaded() {
+  if (tg || !(window.Telegram && window.Telegram.WebApp)) return;
+  tg = window.Telegram.WebApp;
+  tg.ready(); tg.expand();
+  tg.onEvent("deactivated", onHidden);
+  tg.onEvent("activated", onShown);
+  tgQueue.splice(0).forEach((fn) => fn(tg));
+}
+function withTg(fn) { if (tg) fn(tg); else tgQueue.push(fn); }
+function inTelegram() { return !!(tg && tg.initData); }
 const statusEl = document.getElementById("status");
 const button = document.getElementById("copy");
 const tableEl = document.getElementById("rows");
@@ -254,13 +277,60 @@ function renderText(text) {
   document.title = "Текст вебу";
 }
 
+// ── Окно на один показ (шапка файла, «Окно — на один показ») ──
+const STALE = "Это окно уже закрыто. Нажми кнопку в чате ещё раз.";
+let retired = false, wasHidden = false;
+
+function hideData() {
+  TEXT = ""; HTML = "";
+  tableEl.innerHTML = ""; msgEl.innerHTML = ""; msgEl.hidden = true;
+  document.getElementById("wrap").hidden = true;
+  document.getElementById("hint").textContent = "";
+  button.style.display = "none";
+}
+
+// Убрать данные и закрыть Mini App. Вне Telegram (обычная ссылка в браузере) не трогаем ничего.
+// text — что останется на экране, если Telegram покажет этот кадр снова: после копирования —
+// пусто (сразу после «Скопировано» фраза «окно закрыто» сбивала бы), при сворачивании — STALE.
+function retire(text) {
+  withTg(() => {
+    if (!inTelegram()) return;
+    retired = true;
+    hideData();
+    say(text);
+    document.body.dataset.retired = "1";
+    tg.close();
+  });
+}
+
+function onHidden() { wasHidden = true; retire(STALE); }
+function onShown() {
+  // Развернули свёрнутое окно: это прошлый показ, данные уже убраны — сказать и закрыть.
+  if (!wasHidden && !retired) return;
+  withTg(() => { if (!inTelegram()) return; hideData(); say(STALE); setTimeout(() => tg.close(), 1200); });
+}
+
+// Подписки страницы — из main(): тест распаковки гоняет скрипт до main() в node, без DOM.
+function wire() {
+  const tgScript = document.getElementById("tgjs");
+  if (window.Telegram && window.Telegram.WebApp) tgLoaded();
+  else if (tgScript) tgScript.addEventListener("load", tgLoaded);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") onHidden(); });
+  window.addEventListener("pagehide", onHidden);
+  window.addEventListener("pageshow", (e) => { if (e.persisted) { wasHidden = true; onShown(); } });
+}
+
 function done(how) {
   if (MODE === "text") say("✅ Скопировано. Вставь в чат с вебом.", "ok");
   else say("✅ Скопировано: " + N + " " + (N === 1 ? "строка" : N < 5 ? "строки" : "строк") +
            ". Вставь в ячейку A таблицы.", "ok");
   button.style.display = "none";
   document.body.dataset.copied = how;
-  if (tg && tg.initData) setTimeout(() => tg.close(), 900);
+  withTg(() => {
+    if (!inTelegram()) return;
+    hideData();                     // на экране — только «Скопировано», без строк и текста
+    setTimeout(() => retire(""), 900);
+  });
 }
 
 async function viaClipboardApi() {
@@ -305,7 +375,7 @@ async function onButton() {
 }
 
 async function main() {
-  if (tg) { tg.ready(); tg.expand(); }
+  wire();
   // Обычная ссылка — данные во фрагменте (#d=…, серверу не уходят); Mini App — в ?d=.
   const hp = new URLSearchParams(location.hash.slice(1)), qp = new URLSearchParams(location.search);
   const param = hp.get("d") || qp.get("d");
