@@ -35,11 +35,20 @@
 <script id="tgjs" async src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --accent: #2481cc;
-          --soft: #f3f5f7; --err: #cf222e; color-scheme: light; }
+          --soft: #f3f5f7; --err: #cf222e; --good: #1a7f37; --bad: #cf222e; --warn: #9a6700;
+          --info: #0969da; color-scheme: light; }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #17212b; --fg: #e6edf3; --muted: #8b949e; --line: #30363d; --accent: #5aa6e8;
-            --soft: #1f2b37; --err: #ff7b72; color-scheme: dark; }
+            --soft: #1f2b37; --err: #ff7b72; --good: #3fb950; --bad: #ff7b72; --warn: #d29922;
+            --info: #58a6ff; color-scheme: dark; }
   }
+  /* Тему задаёт Telegram (--tg-theme-*), а не системная: цвет чисел — по его схеме. */
+  :root[data-tg-dark="1"] { --good: #3fb950; --bad: #ff7b72; --warn: #d29922; --info: #58a6ff; }
+  :root[data-tg-dark="0"] { --good: #1a7f37; --bad: #cf222e; --warn: #9a6700; --info: #0969da; }
+  .t-good { color: var(--good); font-weight: 600; }
+  .t-bad { color: var(--bad); font-weight: 600; }
+  .t-warn { color: var(--warn); font-weight: 600; }
+  .t-info { color: var(--info); font-weight: 600; }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--tg-theme-bg-color, var(--bg)); color: var(--tg-theme-text-color, var(--fg));
          font: 15px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; overflow-wrap: anywhere; }
@@ -101,6 +110,8 @@ function tgLoaded() {
   if (tg || !(window.Telegram && window.Telegram.WebApp)) return;
   tg = window.Telegram.WebApp;
   tg.ready(); tg.expand();
+  // Вне Telegram скрипт тоже есть и говорит «light» — тогда тема системная (media query).
+  if (tg.initData && tg.colorScheme) document.documentElement.dataset.tgDark = tg.colorScheme === "dark" ? "1" : "0";
 }
 function inTelegram() { return !!(tg && tg.initData); }
 
@@ -115,12 +126,64 @@ function openLink(e) {
   tg.openLink(e.currentTarget.href);
 }
 
+// ── Цвет чисел (Дима, 26.11.26). Цвет всегда при слове, так что он продублирован словом:
+//   зелёный — апрув и рост потока; красный — треш, отказы и отклоны, апрув ниже оффера или нормы,
+//   падение потока; жёлтый — недозвон и автоответчик (это не всегда отклон); синий — «в обработке».
+//   Невалид и «персональной ставки нет» — без цвета.
+// «Апрув 1 из 7», «треш 4» — красится слово с числом. В сравнении («апрув вчера 18,1% против
+// 52,2%», «8 против 46») — только своё число: иначе красного в тексте слишком много. Причины
+// (блеклист, «подумаю», «нет денег») не красятся: это причины, а не статусы.
+const NUM = "\\d+(?:[.,]\\d+)?";
+const RU = "[а-яё]*";                       // окончание слова: \w в JS кириллицу не ловит
+const num = (s) => parseFloat(String(s).replace(",", "."));
+const whole = (cls) => (m) => [[m[0], cls]];
+const TONES = [
+  // апрув: без сравнения — слово и число зелёным; со сравнением — только своё число
+  [new RegExp(`(апрув(?:\\s+(?:вчера|сегодня|за\\s[^:;,%]*?))?\\s+)(${NUM})(%|\\s+из\\s+\\d+)` +
+              `(?:(\\s+против\\s+)(${NUM})%)?`, "i"),
+   (m) => (m[5] === undefined ? [[m[0], "good"]]
+           : [[m[1], null], [m[2] + m[3], num(m[2]) < num(m[5]) ? "bad" : "good"], [m[4] + m[5] + "%", null]])],
+  // треш: слово с числом; «против N%» после — без цвета
+  [new RegExp(`(треш${RU}:?\\s+${NUM}%?(?:\\s+из\\s+\\d+)?)(\\s+против\\s+${NUM}%)?`, "i"),
+   (m) => [[m[1], "bad"], [m[2] || "", null]]],
+  [new RegExp(`(?:отказ|отклон)${RU}:?\\s+${NUM}(?:\\s+из\\s+\\d+)?`, "i"), whole("bad")],
+  [new RegExp(`${NUM}\\s+треш${RU}`, "i"), whole("bad")],
+  [/(?:треш|отклоны|отказы?):/i, whole("bad")],                // число не у слова: «отклоны: подумаю 5»
+  [new RegExp(`(?:недозвон|автоответчик)${RU}:?\\s+${NUM}%?(?:\\s+из\\s+\\d+)?`, "i"), whole("warn")],
+  [/(?:недозвон|автоответчик)[а-яё]*:/i, whole("warn")],
+  [new RegExp(`в обработке\\s+${NUM}`, "i"), whole("info")],
+  // поток лидов: «42 лида против 19», «8 против 46» — только своё число
+  [new RegExp(`(${NUM})(\\s+(?:лид${RU}\\s+)?против\\s+${NUM})(?!\\s*%|[\\d.,])`, "i"),
+   (m) => [[m[1], num(m[1]) >= num(m[2].match(/[\d.,]+$/)[0]) ? "good" : "bad"], [m[2], null]]],
+];
+
+function addTone(el, text) {
+  while (text) {
+    let best = null;
+    for (const [re, parts] of TONES) {
+      const m = re.exec(text);
+      if (m && (!best || m.index < best.m.index)) best = { m, parts };
+    }
+    if (!best) { el.appendChild(document.createTextNode(text)); return; }
+    const { m, parts } = best;
+    if (m.index) el.appendChild(document.createTextNode(text.slice(0, m.index)));
+    for (const [t, cls] of parts(m)) {
+      if (!t) continue;
+      if (!cls) { el.appendChild(document.createTextNode(t)); continue; }
+      const s = document.createElement("span");
+      s.className = "t-" + cls; s.textContent = t;
+      el.appendChild(s);
+    }
+    text = text.slice(m.index + m[0].length);
+  }
+}
+
 function addBold(el, text) {               // **жирный** → <b>
   const parts = text.split("**");
   parts.forEach((p, i) => {
     if (!p) return;
     if (i % 2) { const b = document.createElement("b"); b.textContent = p; el.appendChild(b); }
-    else el.appendChild(document.createTextNode(p));
+    else addTone(el, p);
   });
 }
 
@@ -183,10 +246,13 @@ function parse(text) {
   const out = { title: head[0], intro: head.slice(1), sections: [], tail: [] };
   for (const b of blocks) {
     if (b.length === 1 && /^🕒/.test(b[0])) { out.tail.push(b[0]); continue; }
-    if (b.length > 1 && !isBullet(b[0]) && !isGroup(b[0])) {
-      out.sections.push({ title: b[0], lines: b.slice(1), count: countItems(b.slice(1)) });
-    } else out.sections.push({ title: "", lines: b, count: 0 });
+    const prev = out.sections[out.sections.length - 1];
+    if (b.length > 1 && !isBullet(b[0]) && !isGroup(b[0])) out.sections.push({ title: b[0], lines: b.slice(1) });
+    // Пустая строка между вебами внутри раздела — продолжение того же раздела.
+    else if (prev && prev.title && (isBullet(b[0]) || isGroup(b[0]))) prev.lines.push(...b);
+    else out.sections.push({ title: "", lines: b });
   }
+  out.sections.forEach((s) => { s.count = s.title ? countItems(s.lines) : 0; });
   return out;
 }
 
