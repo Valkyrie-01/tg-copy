@@ -153,7 +153,7 @@ const TONES = [
   [/(?:недозвон|автоответчик)[а-яё]*:/i, whole("warn")],
   [new RegExp(`в обработке\\s+${NUM}`, "i"), whole("info")],
   // поток лидов: «42 лида против 19», «8 против 46» — только своё число
-  [new RegExp(`(${NUM})(\\s+(?:лид${RU}\\s+)?против\\s+${NUM})(?!\\s*%|[\\d.,])`, "i"),
+  [new RegExp(`(${NUM})(\\s+(?:лид${RU}\\s+)?(?:против|при)\\s+${NUM})(?!\\s*%|[\\d.,])`, "i"),
    (m) => [[m[1], num(m[1]) >= num(m[2].match(/[\d.,]+$/)[0]) ? "good" : "bad"], [m[2], null]]],
 ];
 
@@ -212,11 +212,17 @@ function line(tag, cls, text) {
 const isBullet = (s) => /^[•·]/.test(s);
 const isGroup = (s) => /^—/.test(s);
 
+// Подзаголовки динамики: «🟢 Рост», «🔻 Просадка», «⛔ Полный стоп»; с веб-строкой в той же строке
+// («🔻 Просадка — **274536**: …») — это и пункт.
+const isDyn = (s) => /^(?:🟢|🔻|⛔)/.test(s);
+const dynItem = (s) => isDyn(s) && / — /.test(s);
+
 function countItems(lines) {
   let n = 0;
   lines.forEach((s, i) => {
     if (isBullet(s) && !s.endsWith(":")) n++;
     else if (isGroup(s) && !(lines[i + 1] || "").startsWith("·")) n++;
+    else if (dynItem(s)) n++;
   });
   return n;
 }
@@ -224,11 +230,15 @@ function countItems(lines) {
 // Уровень строки раздела: «— веб:» и «•»-пункт верхнего уровня — 0, «·» — 1, «•» под «· Страна
 // тематика:» — 2; строка цифр без маркера и статус «◦» — на уровень глубже своего пункта.
 function layout(lines) {
-  let last = 0, inSub = false;
+  let last = 0, inSub = false, dyn = 0;          // dyn — сдвиг строк под подзаголовком динамики
   return lines.map((s, k) => {
+    if (isDyn(s)) {
+      inSub = false; last = 0; dyn = dynItem(s) ? 0 : 1;
+      return { cls: dynItem(s) ? "item" : "subhead", lvl: 0 };
+    }
     if (isGroup(s)) {
-      inSub = false; last = 0;
-      return { cls: (lines[k + 1] || "").startsWith("·") ? "group" : "item", lvl: 0 };
+      inSub = false; last = dyn;
+      return { cls: (lines[k + 1] || "").startsWith("·") ? "group" : "item", lvl: dyn };
     }
     if (s.startsWith("·")) { inSub = s.endsWith(":"); last = 1; return { cls: inSub ? "subhead" : "sub", lvl: 1 }; }
     if (s.startsWith("•")) { last = inSub ? 2 : 0; return { cls: "item", lvl: last }; }
