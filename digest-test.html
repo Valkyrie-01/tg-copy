@@ -1,0 +1,520 @@
+<!doctype html>
+<!--
+  Окно чтения сводки менеджера (Telegram Mini App): утренняя и вечерняя сводка целиком.
+
+  Зачем: сводка в 6–8 тыс. знаков не влезает в одно сообщение Telegram (4096) и забивает чат.
+  В чат уходит короткое сообщение — шапка и число пунктов по разделам, — а полный текст
+  открывается здесь по кнопке.
+
+  Данные: только в адресе, как у copy.html — текст сводки (markdown: **жирный**,
+  [имя](https://…)), raw deflate, base64url без «=», параметр ?d= (фрагмент #… занят
+  параметрами запуска Telegram). Страница никуда не отправляет данные. Хранит она в браузере
+  (localStorage) только место чтения: хэш адреса, отступ прокрутки и свёрнутые разделы, три дня;
+  текста сводки там нет.
+  ⚠️ Query уходит хостингу в обычном запросе страницы — содержимое сводки видно в его логах.
+  ⚠️ Предел длины адреса — хостинг: GitHub Pages отвечает 414 на адресе длиннее ~8,2 тыс.
+  символов, и Telegram держит такую страницу ошибки в окне на всех кнопках бота, пока окно не
+  закроют крестиком. Поэтому бот не собирает адрес длиннее предела (team_bot/digest.py) и
+  тогда шлёт сводку сообщением, как раньше.
+
+  Окно закрывается само, когда менеджер от него ушёл. Пока окно бота не закрыто, Telegram
+  на любой кнопке-окне этого бота показывает его снова, а адрес новой кнопки выбрасывает:
+  открыл утреннюю — видишь вчерашнюю вечернюю. В Telegram Desktop это видно по исходникам
+  (`AttachWebView::open` в inline_bots/bot_attach_web_view.cpp): окно ищется по боту и виду
+  кнопки, адрес не сравнивается, и событий «свернули/развернули» странице Desktop не шлёт.
+  Перезагрузить себя на новый адрес страница не может, она его не получает. Поэтому она не даёт
+  окну пережить уход:
+    • телефон (platform ios/android): свернули окно (deactivated) или ушли со страницы
+      (pagehide) — закрыть. Уход в другое приложение не закрывает: вернёшься в то же окно;
+    • остальные клиенты: окно потеряло фокус (blur) и не вернуло его за TIMING.grace — закрыть;
+      свернули (visibilitychange hidden) или ушли (pagehide) — закрыть сразу. Переход по ссылке
+      оффера уводит фокус в браузер, и окно тоже закрывается;
+    • окно показали снова (activated, pageshow из кэша, фокус после ухода без касания
+      страницы — так Telegram выводит вперёд старое окно на новой кнопке) — убрать сводку с
+      экрана, «нажми кнопку ещё раз» и закрыть.
+  Место чтения при этом не теряется: открыл ту же сводку кнопкой — страница вернёт прокрутку и
+  свёрнутые разделы. Вне Telegram (страница в браузере) окно ничего не закрывает.
+  Первые TIMING.arm мс после открытия фокус «прыгает»: уход фокуса и скрытие окна в это время
+  не закрывают его (ошибка в безопасную сторону — окно останется открытым, как раньше).
+  Журнал событий для проверки на живом клиенте — параметр trace=1 в адресе: события с
+  временем, фокус, касания, платформа и версия клиента внизу страницы, последние 30 показов
+  (они в localStorage), свежие сверху. trace=1&hold=1 без d — окно журнала: оно само не
+  закрывается и пишет «закрыл бы», чтобы журнал можно было спокойно прочитать и снять скрином.
+
+  Разметка строится через createElement/textContent, без innerHTML: страница публичная, адрес
+  с данными может собрать кто угодно. Ссылкой становится только https://; внутри Telegram она
+  открывается через Telegram.WebApp.openLink.
+
+  Разбор текста (тот же в team_bot/digest.py для короткого сообщения): блоки через пустую
+  строку; первый блок — шапка; блок из нескольких строк, первая не пункт, — раздел с
+  заголовком; пункт — строка с «•» или «·», и строка с «—», если под ней нет «·»-подпунктов.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сводка</title>
+<script id="tgjs" async src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --accent: #2481cc;
+          --soft: #f3f5f7; --err: #cf222e; --good: #1a7f37; --bad: #cf222e; --warn: #9a6700;
+          --info: #0969da; color-scheme: light; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17212b; --fg: #e6edf3; --muted: #8b949e; --line: #30363d; --accent: #5aa6e8;
+            --soft: #1f2b37; --err: #ff7b72; --good: #3fb950; --bad: #ff7b72; --warn: #d29922;
+            --info: #58a6ff; color-scheme: dark; }
+  }
+  /* Тему задаёт Telegram (--tg-theme-*), а не системная: цвет чисел — по его схеме. */
+  :root[data-tg-dark="1"] { --good: #3fb950; --bad: #ff7b72; --warn: #d29922; --info: #58a6ff; }
+  :root[data-tg-dark="0"] { --good: #1a7f37; --bad: #cf222e; --warn: #9a6700; --info: #0969da; }
+  .t-good { color: var(--good); font-weight: 600; }
+  .t-bad { color: var(--bad); font-weight: 600; }
+  .t-warn { color: var(--warn); font-weight: 600; }
+  .t-info { color: var(--info); font-weight: 600; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--tg-theme-bg-color, var(--bg)); color: var(--tg-theme-text-color, var(--fg));
+         font: 15px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; overflow-wrap: anywhere; }
+  header { padding: 12px 16px 10px;
+           background: var(--tg-theme-secondary-bg-color, var(--soft)); border-bottom: 1px solid var(--line); }
+  #title { margin: 0; font-size: 18px; line-height: 1.3; font-weight: 700; }
+  #sub { margin: 2px 0 0; color: var(--tg-theme-hint-color, var(--muted)); font-size: 13px; }
+  nav { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  nav:empty { display: none; }
+  nav a { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 10px;
+          border: 1px solid var(--line); border-radius: 16px; text-decoration: none; font-size: 13px;
+          color: var(--tg-theme-text-color, var(--fg)); background: var(--tg-theme-bg-color, var(--bg)); }
+  nav a b { font-variant-numeric: tabular-nums; }
+  main { padding: 4px 16px 32px; max-width: 760px; }
+  #status { margin: 16px 0; font-size: 16px; }
+  #status.err { color: var(--err); }
+  section { margin-top: 14px; }
+  /* Заголовок раздела держится сверху, пока читаешь раздел: шапка с кнопками разделов на телефоне
+     заняла бы четверть экрана, а одна строка раздела — нет. */
+  details > summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px;
+                      position: sticky; top: 0; z-index: 1; background: var(--tg-theme-bg-color, var(--bg));
+                      padding: 8px 0; font-size: 16px; font-weight: 700; border-bottom: 1px solid var(--line); }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before { content: "▾"; color: var(--tg-theme-hint-color, var(--muted)); width: 12px;
+                              flex: none; transition: transform .15s; }
+  details:not([open]) > summary::before { transform: rotate(-90deg); }
+  .count { margin-left: auto; flex: none; font-weight: 400; font-size: 13px; font-variant-numeric: tabular-nums;
+           color: var(--tg-theme-hint-color, var(--muted)); }
+  p { margin: 6px 0; }
+  .ln { margin-top: 3px; margin-bottom: 3px; }
+  .item, .sub, .stat { padding-left: 12px; text-indent: -12px; }
+  .item { margin-top: 8px; }
+  .group { margin-top: 14px; }
+  .sub, .subhead { margin-top: 8px; }
+  .subhead { font-weight: 600; }
+  .facts { margin-top: 1px; }
+  .note { color: var(--tg-theme-hint-color, var(--muted)); font-size: 13px; }
+  a { color: var(--tg-theme-link-color, var(--accent)); }
+  #trace { margin: 24px 0 0; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px;
+           font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+           color: var(--tg-theme-hint-color, var(--muted)); }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  @media (prefers-reduced-motion: reduce) { details > summary::before { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Сводка</h1>
+  <p id="sub"></p>
+  <nav id="nav" aria-label="Разделы"></nav>
+</header>
+<main>
+  <div id="status" role="status" aria-live="polite">Открываю сводку…</div>
+  <div id="body"></div>
+  <pre id="trace" hidden></pre>
+</main>
+<script src="unpack.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let tg = null;
+function tgLoaded() {
+  if (tg || !(window.Telegram && window.Telegram.WebApp)) return;
+  tg = window.Telegram.WebApp;
+  tg.ready(); tg.expand();
+  // Вне Telegram скрипт тоже есть и говорит «light» — тогда тема системная (media query).
+  if (tg.initData && tg.colorScheme) document.documentElement.dataset.tgDark = tg.colorScheme === "dark" ? "1" : "0";
+  tg.onEvent("deactivated", onDeactivated);
+  tg.onEvent("activated", onActivated);
+  trace("telegram", `platform=${tg.platform || "?"} version=${tg.version || "?"} initData=${tg.initData ? "есть" : "нет"}`);
+}
+function inTelegram() { return !!(tg && tg.initData); }
+
+function say(text, cls) { const s = $("status"); s.textContent = text; s.className = cls || ""; s.hidden = !text; }
+
+// [имя](https://…) — имя может содержать одну пару скобок: «… [RU EUR]».
+const MD_LINK = /\[((?:[^\[\]\n]|\[[^\[\]\n]*\])+)\]\((https:\/\/[^\s)]+)\)/g;
+
+function openLink(e) {
+  if (!inTelegram()) return;                 // в браузере — обычная ссылка в новой вкладке
+  e.preventDefault();
+  trace("link");
+  savePos();                                 // браузер уведёт фокус, и окно закроется
+  tg.openLink(e.currentTarget.href);
+}
+
+// ── Цвет чисел (Дима, 26.11.26). Цвет всегда при слове, так что он продублирован словом:
+//   зелёный — апрув и рост потока; красный — треш, отказы и отклоны, апрув ниже оффера или нормы,
+//   падение потока; жёлтый — недозвон и автоответчик (это не всегда отклон); синий — «в обработке».
+//   Невалид и «персональной ставки нет» — без цвета.
+// «Апрув 1 из 7», «треш 4» — красится слово с числом. В сравнении («апрув вчера 18,1% против
+// 52,2%», «8 против 46») — только своё число: иначе красного в тексте слишком много. Причины
+// (блеклист, «подумаю», «нет денег») не красятся: это причины, а не статусы.
+const NUM = "\\d+(?:[.,]\\d+)?";
+const RU = "[а-яё]*";                       // окончание слова: \w в JS кириллицу не ловит
+const num = (s) => parseFloat(String(s).replace(",", "."));
+const whole = (cls) => (m) => [[m[0], cls]];
+const TONES = [
+  // апрув: без сравнения — слово и число зелёным; со сравнением — только своё число
+  [new RegExp(`(апрув(?:\\s+(?:вчера|сегодня|за\\s[^:;,%]*?))?\\s+)(${NUM})(%|\\s+из\\s+\\d+)` +
+              `(?:(\\s+против\\s+)(${NUM})%)?`, "i"),
+   (m) => (m[5] === undefined ? [[m[0], "good"]]
+           : [[m[1], null], [m[2] + m[3], num(m[2]) < num(m[5]) ? "bad" : "good"], [m[4] + m[5] + "%", null]])],
+  // треш: слово с числом; «против N%» после — без цвета
+  [new RegExp(`(треш${RU}:?\\s+${NUM}%?(?:\\s+из\\s+\\d+)?)(\\s+против\\s+${NUM}%)?`, "i"),
+   (m) => [[m[1], "bad"], [m[2] || "", null]]],
+  [new RegExp(`(?:отказ|отклон)${RU}:?\\s+${NUM}(?:\\s+из\\s+\\d+)?`, "i"), whole("bad")],
+  [new RegExp(`${NUM}\\s+треш${RU}`, "i"), whole("bad")],
+  [/(?:треш|отклоны|отказы?):/i, whole("bad")],                // число не у слова: «отклоны: подумаю 5»
+  [new RegExp(`(?:недозвон|автоответчик)${RU}:?\\s+${NUM}%?(?:\\s+из\\s+\\d+)?`, "i"), whole("warn")],
+  [/(?:недозвон|автоответчик)[а-яё]*:/i, whole("warn")],
+  [new RegExp(`в обработке\\s+${NUM}`, "i"), whole("info")],
+  // поток лидов: «42 лида против 19», «8 против 46» — только своё число
+  [new RegExp(`(${NUM})(\\s+(?:лид${RU}\\s+)?(?:против|при)\\s+${NUM})(?!\\s*%|[\\d.,])`, "i"),
+   (m) => [[m[1], num(m[1]) >= num(m[2].match(/[\d.,]+$/)[0]) ? "good" : "bad"], [m[2], null]]],
+];
+
+function addTone(el, text) {
+  while (text) {
+    let best = null;
+    for (const [re, parts] of TONES) {
+      const m = re.exec(text);
+      if (m && (!best || m.index < best.m.index)) best = { m, parts };
+    }
+    if (!best) { el.appendChild(document.createTextNode(text)); return; }
+    const { m, parts } = best;
+    if (m.index) el.appendChild(document.createTextNode(text.slice(0, m.index)));
+    for (const [t, cls] of parts(m)) {
+      if (!t) continue;
+      if (!cls) { el.appendChild(document.createTextNode(t)); continue; }
+      const s = document.createElement("span");
+      s.className = "t-" + cls; s.textContent = t;
+      el.appendChild(s);
+    }
+    text = text.slice(m.index + m[0].length);
+  }
+}
+
+function addBold(el, text) {               // **жирный** → <b>
+  const parts = text.split("**");
+  parts.forEach((p, i) => {
+    if (!p) return;
+    if (i % 2) { const b = document.createElement("b"); b.textContent = p; el.appendChild(b); }
+    else addTone(el, p);
+  });
+}
+
+function inline(el, text) {
+  let last = 0;
+  for (const m of text.matchAll(MD_LINK)) {
+    addBold(el, text.slice(last, m.index));
+    const a = document.createElement("a");
+    a.href = m[2]; a.target = "_blank"; a.rel = "noopener noreferrer";
+    a.textContent = m[1].replace(/\*\*/g, "");
+    a.addEventListener("click", openLink);
+    el.appendChild(a);
+    last = m.index + m[0].length;
+  }
+  addBold(el, text.slice(last));
+  return el;
+}
+
+function line(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  return inline(el, text);
+}
+
+// ── разбор (зеркало team_bot/digest.py: sections / count_items) ──
+const isBullet = (s) => /^[•·]/.test(s);
+const isGroup = (s) => /^—/.test(s);
+
+// Подзаголовки динамики: «🟢 Рост», «🔻 Просадка», «⛔ Полный стоп»; с веб-строкой в той же строке
+// («🔻 Просадка — **274536**: …») — это и пункт.
+const isDyn = (s) => /^(?:🟢|🔻|⛔)/.test(s);
+const dynItem = (s) => isDyn(s) && / — /.test(s);
+
+function countItems(lines) {
+  let n = 0;
+  lines.forEach((s, i) => {
+    if (isBullet(s) && !s.endsWith(":")) n++;
+    else if (isGroup(s) && !(lines[i + 1] || "").startsWith("·")) n++;
+    else if (dynItem(s)) n++;
+  });
+  return n;
+}
+
+// Уровень строки раздела: «— веб:» и «•»-пункт верхнего уровня — 0, «·» — 1, «•» под «· Страна
+// тематика:» — 2; строка цифр без маркера и статус «◦» — на уровень глубже своего пункта.
+function layout(lines) {
+  let last = 0, inSub = false, dyn = 0;          // dyn — сдвиг строк под подзаголовком динамики
+  return lines.map((s, k) => {
+    if (isDyn(s)) {
+      inSub = false; last = 0; dyn = dynItem(s) ? 0 : 1;
+      return { cls: dynItem(s) ? "item" : "subhead", lvl: 0 };
+    }
+    if (isGroup(s)) {
+      inSub = false; last = dyn;
+      return { cls: (lines[k + 1] || "").startsWith("·") ? "group" : "item", lvl: dyn };
+    }
+    if (s.startsWith("·")) { inSub = s.endsWith(":"); last = 1; return { cls: inSub ? "subhead" : "sub", lvl: 1 }; }
+    if (s.startsWith("•")) { last = inSub ? 2 : 0; return { cls: "item", lvl: last }; }
+    if (s.startsWith("◦")) return { cls: "stat", lvl: last + 1 };
+    if (/^…/.test(s)) return { cls: "note", lvl: last };
+    return { cls: k ? "facts" : "p", lvl: k ? last + 1 : 0 };
+  });
+}
+
+function parse(text) {
+  const blocks = text.replace(/\r/g, "").split(/\n\s*\n/).map((b) => b.split("\n").map((s) => s.trim()).filter(Boolean))
+    .filter((b) => b.length);
+  if (!blocks.length) return null;
+  const head = blocks.shift();
+  const out = { title: head[0], intro: head.slice(1), sections: [], tail: [] };
+  for (const b of blocks) {
+    if (b.length === 1 && /^🕒/.test(b[0])) { out.tail.push(b[0]); continue; }
+    const prev = out.sections[out.sections.length - 1];
+    if (b.length > 1 && !isBullet(b[0]) && !isGroup(b[0])) out.sections.push({ title: b[0], lines: b.slice(1) });
+    // Пустая строка между вебами внутри раздела — продолжение того же раздела.
+    else if (prev && prev.title && (isBullet(b[0]) || isGroup(b[0]))) prev.lines.push(...b);
+    else out.sections.push({ title: "", lines: b });
+  }
+  out.sections.forEach((s) => { s.count = s.title ? countItems(s.lines) : 0; });
+  return out;
+}
+
+function render(text) {
+  const d = parse(text);
+  if (!d) throw new Error("сводка пустая");
+  $("title").textContent = "";
+  inline($("title"), d.title);
+  document.title = d.title.replace(/\*\*/g, "").split(" · ")[0] || "Сводка";
+  $("sub").textContent = d.tail.join(" · ");
+  $("sub").hidden = !d.tail.length;
+  const body = $("body"), nav = $("nav");
+  d.intro.forEach((s) => body.appendChild(line("p", "", s)));
+  d.sections.forEach((sec, i) => {
+    const wrap = document.createElement("section");
+    if (!sec.title) {
+      sec.lines.forEach((s) => body.appendChild(line("p", "", s)));
+      return;
+    }
+    wrap.id = "s" + i;
+    const det = document.createElement("details");
+    det.open = true;
+    det.addEventListener("toggle", savePos);
+    DETAILS.push({ id: wrap.id, det });
+    const sum = line("summary", "", sec.title);
+    if (sec.count) {
+      const c = document.createElement("span");
+      c.className = "count"; c.textContent = sec.count;
+      sum.appendChild(c);
+    }
+    det.appendChild(sum);
+    const lay = layout(sec.lines);
+    sec.lines.forEach((s, k) => {
+      const el = line("div", "ln " + lay[k].cls, s);
+      el.style.marginLeft = lay[k].lvl * 14 + "px";
+      det.appendChild(el);
+    });
+    wrap.appendChild(det);
+    body.appendChild(wrap);
+    const a = document.createElement("a");
+    a.href = "#s" + i;
+    a.textContent = sec.title.replace(/\*\*/g, "").replace(MD_LINK, "$1") + " ";
+    if (sec.count) { const b = document.createElement("b"); b.textContent = sec.count; a.appendChild(b); }
+    a.addEventListener("click", () => { det.open = true; });
+    nav.appendChild(a);
+  });
+  d.tail.length && body.appendChild(line("p", "note", d.tail.join(" · ")));
+}
+
+async function main() {
+  wire();
+  const tgScript = $("tgjs");
+  if (window.Telegram && window.Telegram.WebApp) tgLoaded();
+  else if (tgScript) tgScript.addEventListener("load", tgLoaded);
+  const qp = new URLSearchParams(location.search), hp = new URLSearchParams(location.hash.slice(1));
+  const param = qp.get("d") || hp.get("d");
+  if (!param && TRACE) return say("Окно журнала: ниже — что окна сводки получали от Telegram.");
+  if (!param) return say("В ссылке нет сводки. Нажми кнопку «Открыть сводку» в чате ещё раз.", "err");
+  posId = hashOf(param);
+  try {
+    render(await window.__unpack.unpack(param));
+  } catch (e) {
+    console.error(e);                        // причина — в консоль, менеджеру она ни к чему
+    return say("Сводка не открылась: ссылка повреждена. Нажми кнопку в чате ещё раз; " +
+               "не поможет — напиши Диме.", "err");
+  }
+  say("");
+  if (!HOLD) SHOW.what = document.title.slice(0, 40);
+  restorePos();
+}
+
+// ── Окно закрывается само (шапка файла) ──
+// Задержки, мс: grace — сколько окно может быть без фокуса (клик по шапке окна, меню ⋮);
+// input — касание страницы рядом с возвратом фокуса: было — менеджер вернулся сам, не было —
+// Telegram вывел старое окно на новой кнопке; stale — сколько видна надпись перед закрытием;
+// arm — первые мс после открытия фокус «прыгает», возврат фокуса тогда не проверяем.
+const TIMING = Object.assign({ grace: 800, input: 400, stale: 1500, arm: 1500 }, window.__digestTiming || {});
+const STALE = "Это окно уже закрыто. Нажми кнопку в чате ещё раз.";
+const POS_KEY = "digest-pos", POS_DAYS = 3, POS_KEEP = 20;
+const TRACE_KEY = "digest-trace", TRACE_SHOWS = 30, TRACE_LINES = 60;
+const QP = new URLSearchParams(location.search);
+const TRACE = QP.get("trace") === "1";
+const HOLD = TRACE && QP.get("hold") === "1";   // окно-журнал: «закрыл бы» в журнал, само не закрывается
+const DETAILS = [];                          // {id, det} разделов — для места чтения
+let retired = false, closing = false, awayAt = 0, graceTimer = 0, lastInput = -1e9, posId = "", scrollTimer = 0;
+const ms = () => (window.performance && performance.now ? performance.now() : Date.now());
+const onPhone = () => !!(tg && /^(ios|android)/.test(tg.platform || ""));
+const focused = () => !!(document.hasFocus && document.hasFocus());
+
+function readStore(key) {
+  try { return JSON.parse(window.localStorage.getItem(key) || "null"); } catch (e) { return null; }
+}
+function writeStore(key, val) {
+  try { window.localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* нет хранилища — не запомним */ }
+}
+
+function hashOf(s) {                         // FNV-1a: ключ места чтения, текста сводки в нём нет
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36) + "." + s.length.toString(36);
+}
+
+// ── Место чтения: прокрутка и свёрнутые разделы этой сводки ──
+function savePos() {
+  if (!posId || retired) return;
+  const all = readStore(POS_KEY) || {}, t = Date.now();
+  all[posId] = { y: Math.round(window.scrollY || 0), c: DETAILS.filter((x) => !x.det.open).map((x) => x.id), t };
+  const keep = Object.entries(all).filter(([, v]) => v && t - v.t < POS_DAYS * 864e5)
+    .sort((a, b) => b[1].t - a[1].t).slice(0, POS_KEEP);
+  writeStore(POS_KEY, Object.fromEntries(keep));
+}
+function restorePos() {
+  const p = (readStore(POS_KEY) || {})[posId];
+  if (!p || Date.now() - p.t > POS_DAYS * 864e5) return;
+  DETAILS.forEach((x) => { if ((p.c || []).includes(x.id)) x.det.open = false; });
+  if (p.y > 0) window.scrollTo(0, p.y);
+  trace("место", `y=${p.y} свёрнуто=${(p.c || []).length}`);
+}
+
+// ── Журнал событий (trace=1): что клиент Telegram реально шлёт странице ──
+// what — какая сводка в этом показе (заголовок вкладки ставит main после разбора).
+const SHOW = { id: Date.now(), at: new Date().toLocaleTimeString("ru-RU"), what: HOLD ? "окно журнала" : "", lines: [] };
+function trace(ev, x) {
+  if (!TRACE) return;
+  if (SHOW.lines.length < TRACE_LINES) SHOW.lines.push(`+${Math.round(ms())} мс  ${ev}${x ? "  " + x : ""}`);
+  const shows = (readStore(TRACE_KEY) || []).filter((s) => s && s.id !== SHOW.id);
+  shows.push(SHOW);
+  writeStore(TRACE_KEY, shows.slice(-TRACE_SHOWS));
+  const pre = $("trace");
+  pre.hidden = false;
+  pre.textContent = "Журнал проверки окна (trace=1), свежие показы сверху:\n\n" + shows.slice(-TRACE_SHOWS).reverse()
+    .map((s) => `${s.id === SHOW.id ? "▶ этот показ" : "показ"} · ${s.at} · ${s.what || "—"}\n${s.lines.join("\n")}`)
+    .join("\n\n");
+}
+
+function wipe(why) {                         // убрать сводку с экрана: этот кадр Telegram может показать снова
+  $("body").textContent = ""; $("nav").textContent = "";
+  $("title").textContent = "Сводка"; $("sub").textContent = ""; $("sub").hidden = true;
+  document.title = "Сводка";
+  DETAILS.length = 0;
+  say(STALE);
+  document.body.dataset.retired = why;
+}
+
+// Закрыть окно сразу (менеджер ушёл). Вне Telegram — ничего.
+function retire(why) {
+  if (retired || !inTelegram()) return;
+  if (HOLD) return trace("закрыл бы", why);
+  savePos();
+  retired = true;
+  wipe(why);
+  trace("закрываю", why);
+  tg.close();
+}
+// Telegram показал окно снова: сводки уже нет или она прошлая — сказать и закрыть.
+function shownAgain(why) {
+  if (!inTelegram() || closing) return;
+  if (HOLD) return trace("закрыл бы", why);
+  savePos();
+  retired = closing = true;
+  wipe(why);
+  trace("прошлое окно", why);
+  setTimeout(() => { trace("закрываю", why); tg.close(); }, TIMING.stale);
+}
+
+function onBlur() {
+  trace("blur", `фокус=${focused() ? "да" : "нет"}`);
+  if (!inTelegram() || onPhone() || retired) return;
+  // Фокус «прыгает» при открытии: такой уход не считаем, иначе окно закрылось бы, едва открывшись.
+  // Если фокус так и не вернётся, окно останется открытым, как было до этой правки.
+  if (ms() < TIMING.arm) return trace("blur при открытии — не считаю");
+  awayAt = ms();
+  clearTimeout(graceTimer);
+  graceTimer = setTimeout(() => {
+    trace("проверка фокуса", `фокус=${focused() ? "да" : "нет"}`);
+    if (!focused()) retire("нет фокуса");
+  }, TIMING.grace);
+}
+function onFocus() {
+  trace("focus", `ушёл ${awayAt ? Math.round(ms() - awayAt) + " мс назад" : "—"}, касание ${Math.round(ms() - lastInput)} мс назад`);
+  if (!inTelegram() || onPhone()) return;
+  if (retired) return shownAgain("фокус после закрытия");
+  if (!awayAt) return;
+  const at = ms(), away = at - awayAt;
+  awayAt = 0;
+  clearTimeout(graceTimer);
+  if (at < TIMING.arm) return;               // фокус ещё устраивается после открытия
+  if (away > TIMING.grace) return shownAgain("фокус после ухода");   // таймер придержали в фоне
+  setTimeout(() => { if (!retired && lastInput < at - TIMING.input) shownAgain("фокус без касания"); }, TIMING.input);
+}
+function onVisibility() {
+  trace("visibility", document.visibilityState);
+  if (document.visibilityState !== "hidden") return;
+  if (onPhone()) return savePos();           // другое приложение: вернёшься в это же окно
+  // При открытии окно может мигнуть hidden → visible: закрываем, только если скрыто и после arm.
+  const wait = TIMING.arm - ms();
+  if (wait > 0) return setTimeout(() => { if (document.visibilityState === "hidden") retire("окно скрыто"); }, wait);
+  retire("окно скрыто");
+}
+function onDeactivated() { trace("deactivated"); retire("свернули"); }
+function onActivated() { trace("activated"); if (retired) shownAgain("развернули"); }
+
+// Подписки — из main(): тесты разбора гоняют скрипт без DOM и до main() не доходят.
+function wire() {
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("focus", onFocus);
+  document.addEventListener("visibilitychange", onVisibility);
+  window.addEventListener("pagehide", () => { trace("pagehide"); retire("ушли со страницы"); });
+  window.addEventListener("pageshow", (e) => { trace("pageshow", e.persisted ? "из кэша" : ""); if (e.persisted) shownAgain("из кэша страниц"); });
+  window.addEventListener("scroll", () => { clearTimeout(scrollTimer); scrollTimer = setTimeout(savePos, 300); }, { passive: true });
+  const touched = (e) => {
+    if (ms() - lastInput > 1000) trace("касание", e && e.type);   // журнал — не чаще раза в секунду
+    lastInput = ms();
+  };
+  for (const ev of ["pointerdown", "mousedown", "touchstart", "keydown", "wheel"])
+    document.addEventListener(ev, touched, { capture: true, passive: true });
+  trace("открыто", `${location.search.length} знаков адреса, фокус=${focused() ? "да" : "нет"}, ${document.visibilityState}`);
+}
+
+window.__digestPage = { parse, countItems };
+main();
+</script>
+</body>
+</html>
