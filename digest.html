@@ -8,16 +8,38 @@
 
   Данные: только в адресе, как у copy.html — текст сводки (markdown: **жирный**,
   [имя](https://…)), raw deflate, base64url без «=», параметр ?d= (фрагмент #… занят
-  параметрами запуска Telegram). Страница ничего не хранит и никуда не отправляет.
+  параметрами запуска Telegram). Страница никуда не отправляет данные. Хранит она в браузере
+  (localStorage) только место чтения: хэш адреса, отступ прокрутки и свёрнутые разделы, три дня;
+  текста сводки там нет.
   ⚠️ Query уходит хостингу в обычном запросе страницы — содержимое сводки видно в его логах.
   ⚠️ Предел длины адреса — хостинг: GitHub Pages отвечает 414 на адресе длиннее ~8,2 тыс.
   символов, и Telegram держит такую страницу ошибки в окне на всех кнопках бота, пока окно не
   закроют крестиком. Поэтому бот не собирает адрес длиннее предела (team_bot/digest.py) и
   тогда шлёт сводку сообщением, как раньше.
 
-  Окно не одноразовое, в отличие от copy.html: здесь нечего скопировать по ошибке, а сводку
-  читают, сворачивают и возвращаются к ней. Шапка с днём и видом сводки крупно сверху: Telegram
-  может сначала показать прошлое окно, и по шапке видно, какая это сводка.
+  Окно закрывается само, когда менеджер от него ушёл. Пока окно бота не закрыто, Telegram
+  на любой кнопке-окне этого бота показывает его снова, а адрес новой кнопки выбрасывает:
+  открыл утреннюю — видишь вчерашнюю вечернюю. В Telegram Desktop это видно по исходникам
+  (`AttachWebView::open` в inline_bots/bot_attach_web_view.cpp): окно ищется по боту и виду
+  кнопки, адрес не сравнивается, и событий «свернули/развернули» странице Desktop не шлёт.
+  Перезагрузить себя на новый адрес страница не может, она его не получает. Поэтому она не даёт
+  окну пережить уход:
+    • телефон (platform ios/android): свернули окно (deactivated) или ушли со страницы
+      (pagehide) — закрыть. Уход в другое приложение не закрывает: вернёшься в то же окно;
+    • остальные клиенты: окно потеряло фокус (blur) и не вернуло его за TIMING.grace — закрыть;
+      свернули (visibilitychange hidden) или ушли (pagehide) — закрыть сразу. Переход по ссылке
+      оффера уводит фокус в браузер, и окно тоже закрывается;
+    • окно показали снова (activated, pageshow из кэша, фокус после ухода без касания
+      страницы — так Telegram выводит вперёд старое окно на новой кнопке) — убрать сводку с
+      экрана, «нажми кнопку ещё раз» и закрыть.
+  Место чтения при этом не теряется: открыл ту же сводку кнопкой — страница вернёт прокрутку и
+  свёрнутые разделы. Вне Telegram (страница в браузере) окно ничего не закрывает.
+  Первые TIMING.arm мс после открытия фокус «прыгает»: уход фокуса и скрытие окна в это время
+  не закрывают его (ошибка в безопасную сторону — окно останется открытым, как раньше).
+  Журнал событий для проверки на живом клиенте — параметр trace=1 в адресе: события с
+  временем, фокус, касания, платформа и версия клиента внизу страницы, последние 30 показов
+  (они в localStorage), свежие сверху. trace=1&hold=1 без d — окно журнала: оно само не
+  закрывается и пишет «закрыл бы», чтобы журнал можно было спокойно прочитать и снять скрином.
 
   Разметка строится через createElement/textContent, без innerHTML: страница публичная, адрес
   с данными может собрать кто угодно. Ссылкой становится только https://; внутри Telegram она
@@ -87,6 +109,9 @@
   .facts { margin-top: 1px; }
   .note { color: var(--tg-theme-hint-color, var(--muted)); font-size: 13px; }
   a { color: var(--tg-theme-link-color, var(--accent)); }
+  #trace { margin: 24px 0 0; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px;
+           font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+           color: var(--tg-theme-hint-color, var(--muted)); }
   a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
   @media (prefers-reduced-motion: reduce) { details > summary::before { transition: none; } }
 </style>
@@ -100,6 +125,7 @@
 <main>
   <div id="status" role="status" aria-live="polite">Открываю сводку…</div>
   <div id="body"></div>
+  <pre id="trace" hidden></pre>
 </main>
 <script src="unpack.js"></script>
 <script>
@@ -112,6 +138,9 @@ function tgLoaded() {
   tg.ready(); tg.expand();
   // Вне Telegram скрипт тоже есть и говорит «light» — тогда тема системная (media query).
   if (tg.initData && tg.colorScheme) document.documentElement.dataset.tgDark = tg.colorScheme === "dark" ? "1" : "0";
+  tg.onEvent("deactivated", onDeactivated);
+  tg.onEvent("activated", onActivated);
+  trace("telegram", `platform=${tg.platform || "?"} version=${tg.version || "?"} initData=${tg.initData ? "есть" : "нет"}`);
 }
 function inTelegram() { return !!(tg && tg.initData); }
 
@@ -123,6 +152,8 @@ const MD_LINK = /\[((?:[^\[\]\n]|\[[^\[\]\n]*\])+)\]\((https:\/\/[^\s)]+)\)/g;
 function openLink(e) {
   if (!inTelegram()) return;                 // в браузере — обычная ссылка в новой вкладке
   e.preventDefault();
+  trace("link");
+  savePos();                                 // браузер уведёт фокус, и окно закроется
   tg.openLink(e.currentTarget.href);
 }
 
@@ -285,6 +316,8 @@ function render(text) {
     wrap.id = "s" + i;
     const det = document.createElement("details");
     det.open = true;
+    det.addEventListener("toggle", savePos);
+    DETAILS.push({ id: wrap.id, det });
     const sum = line("summary", "", sec.title);
     if (sec.count) {
       const c = document.createElement("span");
@@ -311,12 +344,15 @@ function render(text) {
 }
 
 async function main() {
+  wire();
   const tgScript = $("tgjs");
   if (window.Telegram && window.Telegram.WebApp) tgLoaded();
   else if (tgScript) tgScript.addEventListener("load", tgLoaded);
   const qp = new URLSearchParams(location.search), hp = new URLSearchParams(location.hash.slice(1));
   const param = qp.get("d") || hp.get("d");
+  if (!param && TRACE) return say("Окно журнала: ниже — что окна сводки получали от Telegram.");
   if (!param) return say("В ссылке нет сводки. Нажми кнопку «Открыть сводку» в чате ещё раз.", "err");
+  posId = hashOf(param);
   try {
     render(await window.__unpack.unpack(param));
   } catch (e) {
@@ -325,6 +361,156 @@ async function main() {
                "не поможет — напиши Диме.", "err");
   }
   say("");
+  if (!HOLD) SHOW.what = document.title.slice(0, 40);
+  restorePos();
+}
+
+// ── Окно закрывается само (шапка файла) ──
+// Задержки, мс: grace — сколько окно может быть без фокуса (клик по шапке окна, меню ⋮);
+// input — касание страницы рядом с возвратом фокуса: было — менеджер вернулся сам, не было —
+// Telegram вывел старое окно на новой кнопке; stale — сколько видна надпись перед закрытием;
+// arm — первые мс после открытия фокус «прыгает», возврат фокуса тогда не проверяем.
+const TIMING = Object.assign({ grace: 800, input: 400, stale: 1500, arm: 1500 }, window.__digestTiming || {});
+const STALE = "Это окно уже закрыто. Нажми кнопку в чате ещё раз.";
+const POS_KEY = "digest-pos", POS_DAYS = 3, POS_KEEP = 20;
+const TRACE_KEY = "digest-trace", TRACE_SHOWS = 30, TRACE_LINES = 60;
+const QP = new URLSearchParams(location.search);
+const TRACE = QP.get("trace") === "1";
+const HOLD = TRACE && QP.get("hold") === "1";   // окно-журнал: «закрыл бы» в журнал, само не закрывается
+const DETAILS = [];                          // {id, det} разделов — для места чтения
+let retired = false, closing = false, awayAt = 0, graceTimer = 0, lastInput = -1e9, posId = "", scrollTimer = 0;
+const ms = () => (window.performance && performance.now ? performance.now() : Date.now());
+const onPhone = () => !!(tg && /^(ios|android)/.test(tg.platform || ""));
+const focused = () => !!(document.hasFocus && document.hasFocus());
+
+function readStore(key) {
+  try { return JSON.parse(window.localStorage.getItem(key) || "null"); } catch (e) { return null; }
+}
+function writeStore(key, val) {
+  try { window.localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* нет хранилища — не запомним */ }
+}
+
+function hashOf(s) {                         // FNV-1a: ключ места чтения, текста сводки в нём нет
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36) + "." + s.length.toString(36);
+}
+
+// ── Место чтения: прокрутка и свёрнутые разделы этой сводки ──
+function savePos() {
+  if (!posId || retired) return;
+  const all = readStore(POS_KEY) || {}, t = Date.now();
+  all[posId] = { y: Math.round(window.scrollY || 0), c: DETAILS.filter((x) => !x.det.open).map((x) => x.id), t };
+  const keep = Object.entries(all).filter(([, v]) => v && t - v.t < POS_DAYS * 864e5)
+    .sort((a, b) => b[1].t - a[1].t).slice(0, POS_KEEP);
+  writeStore(POS_KEY, Object.fromEntries(keep));
+}
+function restorePos() {
+  const p = (readStore(POS_KEY) || {})[posId];
+  if (!p || Date.now() - p.t > POS_DAYS * 864e5) return;
+  DETAILS.forEach((x) => { if ((p.c || []).includes(x.id)) x.det.open = false; });
+  if (p.y > 0) window.scrollTo(0, p.y);
+  trace("место", `y=${p.y} свёрнуто=${(p.c || []).length}`);
+}
+
+// ── Журнал событий (trace=1): что клиент Telegram реально шлёт странице ──
+// what — какая сводка в этом показе (заголовок вкладки ставит main после разбора).
+const SHOW = { id: Date.now(), at: new Date().toLocaleTimeString("ru-RU"), what: HOLD ? "окно журнала" : "", lines: [] };
+function trace(ev, x) {
+  if (!TRACE) return;
+  if (SHOW.lines.length < TRACE_LINES) SHOW.lines.push(`+${Math.round(ms())} мс  ${ev}${x ? "  " + x : ""}`);
+  const shows = (readStore(TRACE_KEY) || []).filter((s) => s && s.id !== SHOW.id);
+  shows.push(SHOW);
+  writeStore(TRACE_KEY, shows.slice(-TRACE_SHOWS));
+  const pre = $("trace");
+  pre.hidden = false;
+  pre.textContent = "Журнал проверки окна (trace=1), свежие показы сверху:\n\n" + shows.slice(-TRACE_SHOWS).reverse()
+    .map((s) => `${s.id === SHOW.id ? "▶ этот показ" : "показ"} · ${s.at} · ${s.what || "—"}\n${s.lines.join("\n")}`)
+    .join("\n\n");
+}
+
+function wipe(why) {                         // убрать сводку с экрана: этот кадр Telegram может показать снова
+  $("body").textContent = ""; $("nav").textContent = "";
+  $("title").textContent = "Сводка"; $("sub").textContent = ""; $("sub").hidden = true;
+  document.title = "Сводка";
+  DETAILS.length = 0;
+  say(STALE);
+  document.body.dataset.retired = why;
+}
+
+// Закрыть окно сразу (менеджер ушёл). Вне Telegram — ничего.
+function retire(why) {
+  if (retired || !inTelegram()) return;
+  if (HOLD) return trace("закрыл бы", why);
+  savePos();
+  retired = true;
+  wipe(why);
+  trace("закрываю", why);
+  tg.close();
+}
+// Telegram показал окно снова: сводки уже нет или она прошлая — сказать и закрыть.
+function shownAgain(why) {
+  if (!inTelegram() || closing) return;
+  if (HOLD) return trace("закрыл бы", why);
+  savePos();
+  retired = closing = true;
+  wipe(why);
+  trace("прошлое окно", why);
+  setTimeout(() => { trace("закрываю", why); tg.close(); }, TIMING.stale);
+}
+
+function onBlur() {
+  trace("blur", `фокус=${focused() ? "да" : "нет"}`);
+  if (!inTelegram() || onPhone() || retired) return;
+  // Фокус «прыгает» при открытии: такой уход не считаем, иначе окно закрылось бы, едва открывшись.
+  // Если фокус так и не вернётся, окно останется открытым, как было до этой правки.
+  if (ms() < TIMING.arm) return trace("blur при открытии — не считаю");
+  awayAt = ms();
+  clearTimeout(graceTimer);
+  graceTimer = setTimeout(() => {
+    trace("проверка фокуса", `фокус=${focused() ? "да" : "нет"}`);
+    if (!focused()) retire("нет фокуса");
+  }, TIMING.grace);
+}
+function onFocus() {
+  trace("focus", `ушёл ${awayAt ? Math.round(ms() - awayAt) + " мс назад" : "—"}, касание ${Math.round(ms() - lastInput)} мс назад`);
+  if (!inTelegram() || onPhone()) return;
+  if (retired) return shownAgain("фокус после закрытия");
+  if (!awayAt) return;
+  const at = ms(), away = at - awayAt;
+  awayAt = 0;
+  clearTimeout(graceTimer);
+  if (at < TIMING.arm) return;               // фокус ещё устраивается после открытия
+  if (away > TIMING.grace) return shownAgain("фокус после ухода");   // таймер придержали в фоне
+  setTimeout(() => { if (!retired && lastInput < at - TIMING.input) shownAgain("фокус без касания"); }, TIMING.input);
+}
+function onVisibility() {
+  trace("visibility", document.visibilityState);
+  if (document.visibilityState !== "hidden") return;
+  if (onPhone()) return savePos();           // другое приложение: вернёшься в это же окно
+  // При открытии окно может мигнуть hidden → visible: закрываем, только если скрыто и после arm.
+  const wait = TIMING.arm - ms();
+  if (wait > 0) return setTimeout(() => { if (document.visibilityState === "hidden") retire("окно скрыто"); }, wait);
+  retire("окно скрыто");
+}
+function onDeactivated() { trace("deactivated"); retire("свернули"); }
+function onActivated() { trace("activated"); if (retired) shownAgain("развернули"); }
+
+// Подписки — из main(): тесты разбора гоняют скрипт без DOM и до main() не доходят.
+function wire() {
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("focus", onFocus);
+  document.addEventListener("visibilitychange", onVisibility);
+  window.addEventListener("pagehide", () => { trace("pagehide"); retire("ушли со страницы"); });
+  window.addEventListener("pageshow", (e) => { trace("pageshow", e.persisted ? "из кэша" : ""); if (e.persisted) shownAgain("из кэша страниц"); });
+  window.addEventListener("scroll", () => { clearTimeout(scrollTimer); scrollTimer = setTimeout(savePos, 300); }, { passive: true });
+  const touched = (e) => {
+    if (ms() - lastInput > 1000) trace("касание", e && e.type);   // журнал — не чаще раза в секунду
+    lastInput = ms();
+  };
+  for (const ev of ["pointerdown", "mousedown", "touchstart", "keydown", "wheel"])
+    document.addEventListener(ev, touched, { capture: true, passive: true });
+  trace("открыто", `${location.search.length} знаков адреса, фокус=${focused() ? "да" : "нет"}, ${document.visibilityState}`);
 }
 
 window.__digestPage = { parse, countItems };
