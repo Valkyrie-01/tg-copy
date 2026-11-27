@@ -18,31 +18,30 @@
   закроют крестиком. Поэтому бот не собирает адрес длиннее предела (team_bot/digest.py) и
   тогда шлёт сводку сообщением, как раньше.
 
-  Окно закрывается само, когда менеджер от него ушёл. Пока окно бота не закрыто, Telegram
-  на любой кнопке-окне этого бота показывает его снова, а адрес новой кнопки выбрасывает:
-  открыл утреннюю — видишь вчерашнюю вечернюю. В Telegram Desktop это видно по исходникам
-  (`AttachWebView::open` в inline_bots/bot_attach_web_view.cpp): окно ищется по боту и виду
-  кнопки, адрес не сравнивается, и событий «свернули/развернули» странице Desktop не шлёт.
-  Перезагрузить себя на новый адрес страница не может, она его не получает. Поэтому она не даёт
-  окну пережить уход:
-    • телефон (platform ios/android): свернули окно (deactivated) или ушли со страницы
-      (pagehide) — закрыть. Уход в другое приложение не закрывает: вернёшься в то же окно;
-    • остальные клиенты: окно потеряло фокус (blur) и не вернуло его за TIMING.grace — закрыть;
-      свернули (visibilitychange hidden) или ушли (pagehide) — закрыть сразу. Переход по ссылке
-      оффера уводит фокус в браузер, и окно тоже закрывается;
-    • окно показали снова (activated, pageshow из кэша, фокус после ухода без касания
-      страницы — так Telegram выводит вперёд старое окно на новой кнопке) — убрать сводку с
-      экрана, «нажми кнопку ещё раз» и закрыть.
-  Место чтения при этом не теряется: открыл ту же сводку кнопкой — страница вернёт прокрутку и
-  свёрнутые разделы. Вне Telegram (страница в браузере) окно ничего не закрывает.
-  Первые TIMING.arm мс после запуска скрипта фокус и видимость «прыгают» (на Mac страница
-  грузится скрытой и через 30–90 мс становится видимой). Уход фокуса в это время не считается
-  вовсе: если фокус так и не вернётся, окно останется открытым, как раньше. Скрытие в это время
-  перепроверяется на границе arm: окно мигнуло и снова видно — живёт, всё ещё скрыто — закрывается.
-  Известные риски закрыть окно у читающего: фокус ушёл на шапку окна или в меню ⋮ после клика
-  в страницу и не вернулся за TIMING.grace; быстрый Cmd-Tab туда и обратно без клика в страницу
-  (выглядит как старое окно на новой кнопке). По замеру на Mac blur без hidden не приходил,
-  на других клиентах не замерено. «Перезагрузить» из меню окна — pagehide, окно закрывается.
+  Окно живёт, пока менеджер рядом, и закрывается само после долгого ухода. Пока окно бота не
+  закрыто, Telegram на любой кнопке-окне этого бота показывает его снова, а адрес новой кнопки
+  выбрасывает: открыл утреннюю — видишь вчерашнюю вечернюю. В Telegram Desktop это видно по
+  исходникам (`AttachWebView::open` в inline_bots/bot_attach_web_view.cpp): окно ищется по боту
+  и виду кнопки, адрес не сравнивается, и событий «свернули/развернули» Desktop не шлёт.
+  Перезагрузить себя на новый адрес страница не может, она его не получает. Закрывать окно сразу
+  при уходе тоже плохо: сводку сворачивают, чтобы что-то проверить, и возвращаются к ней. Поэтому
+  середина — окно ждёт ушедшего менеджера TIMING.away (15 минут):
+    • ушёл — окно скрыто (visibilitychange hidden: клик в чат, другое окно, ссылка оффера),
+      свёрнуто (deactivated) или без фокуса (blur) — пошёл отсчёт; место чтения сохраняется;
+    • вернулся раньше — окно скрыто → видно, развернули, фокус или касание видимой страницы
+      (окно рядом с чатом) — отсчёт снят, окно как было. В эти 15 минут другая кнопка бота
+      покажет это окно, а не новое: это цена;
+    • не вернулся — по таймеру окно закрывается в фоне, следующая кнопка откроет свежее окно;
+    • таймер в фоне простоял (сон Мака, телефон в фоне) и окно показали после долгого ухода —
+      уход меряется по часам: сводка убирается с экрана, «нажми кнопку ещё раз» и закрыть;
+    • ушли со страницы (pagehide: крестик, «Перезагрузить» в меню окна) — закрыть сразу;
+      страница из кэша (pageshow persisted) — «нажми кнопку ещё раз» и закрыть.
+  Та же сводка по своей кнопке открывается на месте, где её оставили: прокрутка и свёрнутые
+  разделы. Вне Telegram (страница в браузере) окно ничего не закрывает.
+  Замер Telegram Desktop для Mac 9.6 (27.11.26): страница грузится скрытой и через 30–90 мс
+  становится видимой (мигание hidden → visible отсчёт сразу снимает); фокуса при открытии нет,
+  focus приходит после клика в страницу; клик в чат, ссылка и крестик дают hidden.
+  Риск: окно рядом с чатом, без фокуса, и его 15 минут не листают и не трогают — закроется.
   Журнал событий для проверки на живом клиенте — параметр trace=1 в адресе: события с
   временем, фокус, касания, платформа и версия клиента внизу страницы, последние 30 показов
   (они в localStorage), свежие сверху. trace=1&hold=1 без d — окно журнала: оно само не
@@ -161,7 +160,7 @@ function openLink(e) {
   if (!inTelegram()) return;                 // в браузере — обычная ссылка в новой вкладке
   e.preventDefault();
   trace("link");
-  savePos();                                 // браузер уведёт фокус, и окно закроется
+  savePos();                                 // браузер уведёт фокус: окно ждёт возврата (leave)
   tg.openLink(e.currentTarget.href);
 }
 
@@ -380,14 +379,11 @@ async function main() {
   restorePos();
 }
 
-// ── Окно закрывается само (шапка файла) ──
-// Задержки, мс: grace — сколько окно может быть без фокуса (клик по шапке окна, меню ⋮);
-// input — касание страницы рядом с возвратом фокуса: было — менеджер вернулся сам, не было —
-// Telegram вывел старое окно на новой кнопке; stale — сколько видна надпись перед закрытием;
-// arm — первые мс после запуска скрипта страницы фокус «прыгает», возврат фокуса тогда не
-// проверяем. Отсчёт от запуска скрипта (T0), а не от начала загрузки: на медленной сети загрузка
-// сама съела бы эти 1,5 с.
-const TIMING = Object.assign({ grace: 800, input: 400, stale: 1500, arm: 1500 }, window.__digestTiming || {});
+// ── Окно живёт, пока менеджер рядом, и закрывается после долгого ухода (шапка файла) ──
+// Задержки, мс: away — сколько окно ждёт ушедшего менеджера (скрыто, свёрнуто или без фокуса и
+// без касаний), потом закрывается само; stale — сколько видна надпись «окно закрыто» перед
+// закрытием, когда окно показали снова после долгого ухода.
+const TIMING = Object.assign({ away: 15 * 60 * 1000, stale: 1500 }, window.__digestTiming || {});
 const STALE = "Это окно уже закрыто. Нажми кнопку в чате ещё раз.";
 const POS_KEY = "digest-pos", POS_DAYS = 3, POS_KEEP = 20;
 const TRACE_KEY = "digest-trace", TRACE_SHOWS = 30, TRACE_LINES = 60;
@@ -395,11 +391,9 @@ const QP = new URLSearchParams(location.search);
 const TRACE = QP.get("trace") === "1";
 const HOLD = TRACE && QP.get("hold") === "1";   // окно-журнал: «закрыл бы» в журнал, само не закрывается
 const DETAILS = [];                          // {id, det} разделов — для места чтения
-let retired = false, closing = false, awayAt = 0, graceTimer = 0, lastInput = -1e9, posId = "", scrollTimer = 0;
-const ms = () => (window.performance && performance.now ? performance.now() : Date.now());
-const T0 = ms();
-const sinceStart = () => ms() - T0;
-const onPhone = () => !!(tg && /^(ios|android)/.test(tg.platform || ""));
+let retired = false, closing = false, awayAt = 0, awayWhy = "", awayTimer = 0, lastInput = -1e9;
+let posId = "", scrollTimer = 0;
+const ms = () => (window.performance && performance.now ? performance.now() : Date.now());   // журнал
 const focused = () => !!(document.hasFocus && document.hasFocus());
 
 function readStore(key) {
@@ -457,7 +451,7 @@ function wipe(why) {                         // убрать сводку с э�
   document.body.dataset.retired = why;
 }
 
-// Закрыть окно сразу (менеджер ушёл). Вне Telegram — ничего.
+// Закрыть окно сразу. Вне Telegram — ничего.
 function retire(why) {
   if (retired || !inTelegram()) return;
   if (HOLD) return trace("закрыл бы", why);
@@ -467,7 +461,7 @@ function retire(why) {
   trace("закрываю", why);
   tg.close();
 }
-// Telegram показал окно снова: сводки уже нет или она прошлая — сказать и закрыть.
+// Окно показали снова после долгого ухода (или уже закрытым): сказать и закрыть.
 function shownAgain(why) {
   if (!inTelegram() || closing) return;
   if (HOLD) return trace("закрыл бы", why);
@@ -478,42 +472,36 @@ function shownAgain(why) {
   setTimeout(() => { trace("закрываю", why); tg.close(); }, TIMING.stale);
 }
 
-function onBlur() {
-  trace("blur", `фокус=${focused() ? "да" : "нет"}`);
-  if (!inTelegram() || onPhone() || retired) return;
-  // Фокус «прыгает» при открытии: такой уход не считаем, иначе окно закрылось бы, едва открывшись.
-  // Если фокус так и не вернётся, окно останется открытым, как было до этой правки.
-  if (sinceStart() < TIMING.arm) return trace("blur при открытии — не считаю");
-  awayAt = ms();
-  clearTimeout(graceTimer);
-  graceTimer = setTimeout(() => {
-    trace("проверка фокуса", `фокус=${focused() ? "да" : "нет"}`);
-    if (!focused()) retire("нет фокуса");
-  }, TIMING.grace);
+// Менеджер ушёл: окно скрыто, свёрнуто или без фокуса. Не вернулся за TIMING.away — закрыть.
+// Уход меряется по часам (Date.now): во сне Мака и в фоне телефона таймер стоит, а часы идут, и
+// возврат после долгого ухода поймает back().
+function leave(why) {
+  trace("ушёл", why);
+  if (!inTelegram() || retired) return;
+  savePos();
+  if (!awayAt) { awayAt = Date.now(); awayWhy = why; }
+  clearTimeout(awayTimer);
+  awayTimer = setTimeout(() => retire("долго не было: " + awayWhy), Math.max(0, awayAt + TIMING.away - Date.now()));
 }
-function onFocus() {
-  trace("focus", `ушёл ${awayAt ? Math.round(ms() - awayAt) + " мс назад" : "—"}, касание ${Math.round(ms() - lastInput)} мс назад`);
-  if (!inTelegram() || onPhone()) return;
-  if (retired) return shownAgain("фокус после закрытия");
+// Менеджер вернулся (или Telegram снова показал окно). Ушёл давно — сводка прошлая: сказать и закрыть.
+function back(why) {
+  trace("вернулся", why);
+  if (!inTelegram()) return;
+  if (retired) return shownAgain(why);
   if (!awayAt) return;
-  const at = ms(), away = at - awayAt;
+  const away = Date.now() - awayAt;
   awayAt = 0;
-  clearTimeout(graceTimer);
-  if (at - T0 < TIMING.arm) return;          // фокус ещё устраивается после открытия
-  if (away > TIMING.grace) return shownAgain("фокус после ухода");   // таймер придержали в фоне
-  setTimeout(() => { if (!retired && lastInput < at - TIMING.input) shownAgain("фокус без касания"); }, TIMING.input);
+  clearTimeout(awayTimer);
+  if (away > TIMING.away) shownAgain(`вернулись через ${Math.round(away / 60000)} мин`);
 }
+function onBlur() { trace("blur", `фокус=${focused() ? "да" : "нет"}`); leave("без фокуса"); }
+function onFocus() { trace("focus"); back("фокус"); }
 function onVisibility() {
   trace("visibility", document.visibilityState);
-  if (document.visibilityState !== "hidden") return;
-  if (onPhone()) return savePos();           // другое приложение: вернёшься в это же окно
-  // При открытии окно может мигнуть hidden → visible: закрываем, только если скрыто и после arm.
-  const wait = TIMING.arm - sinceStart();
-  if (wait > 0) return setTimeout(() => { if (document.visibilityState === "hidden") retire("окно скрыто"); }, wait);
-  retire("окно скрыто");
+  if (document.visibilityState === "hidden") leave("скрыто"); else back("снова видно");
 }
-function onDeactivated() { trace("deactivated"); retire("свернули"); }
-function onActivated() { trace("activated"); if (retired) shownAgain("развернули"); }
+function onDeactivated() { trace("deactivated"); leave("свернули"); }
+function onActivated() { trace("activated"); back("развернули"); }
 
 // Подписки — из main(): тесты разбора гоняют скрипт без DOM и до main() не доходят.
 function wire() {
@@ -523,9 +511,11 @@ function wire() {
   window.addEventListener("pagehide", () => { trace("pagehide"); retire("ушли со страницы"); });
   window.addEventListener("pageshow", (e) => { trace("pageshow", e.persisted ? "из кэша" : ""); if (e.persisted) shownAgain("из кэша страниц"); });
   window.addEventListener("scroll", () => { clearTimeout(scrollTimer); scrollTimer = setTimeout(savePos, 300); }, { passive: true });
+  // Касание видимой страницы — менеджер здесь, даже если фокус у другого окна (окно рядом с чатом).
   const touched = (e) => {
     if (ms() - lastInput > 1000) trace("касание", e && e.type);   // журнал — не чаще раза в секунду
     lastInput = ms();
+    if (awayAt && document.visibilityState !== "hidden") back("касание");
   };
   for (const ev of ["pointerdown", "mousedown", "touchstart", "keydown", "wheel"])
     document.addEventListener(ev, touched, { capture: true, passive: true });
