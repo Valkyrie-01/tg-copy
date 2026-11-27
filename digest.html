@@ -9,8 +9,9 @@
   Данные: только в адресе, как у copy.html — текст сводки (markdown: **жирный**,
   [имя](https://…)), raw deflate, base64url без «=», параметр ?d= (фрагмент #… занят
   параметрами запуска Telegram). Страница никуда не отправляет данные. Хранит она в браузере
-  (localStorage) только место чтения: хэш адреса, отступ прокрутки и свёрнутые разделы, три дня;
-  текста сводки там нет.
+  (localStorage) место чтения: хэш адреса, отступ прокрутки и номера свёрнутых разделов, три дня;
+  текста сводки там нет. Только в режиме проверки trace=1 там же лежит журнал событий последних
+  30 показов с заголовком сводки (первая строка до « · », не длиннее 40 знаков).
   ⚠️ Query уходит хостингу в обычном запросе страницы — содержимое сводки видно в его логах.
   ⚠️ Предел длины адреса — хостинг: GitHub Pages отвечает 414 на адресе длиннее ~8,2 тыс.
   символов, и Telegram держит такую страницу ошибки в окне на всех кнопках бота, пока окно не
@@ -34,8 +35,14 @@
       экрана, «нажми кнопку ещё раз» и закрыть.
   Место чтения при этом не теряется: открыл ту же сводку кнопкой — страница вернёт прокрутку и
   свёрнутые разделы. Вне Telegram (страница в браузере) окно ничего не закрывает.
-  Первые TIMING.arm мс после открытия фокус «прыгает»: уход фокуса и скрытие окна в это время
-  не закрывают его (ошибка в безопасную сторону — окно останется открытым, как раньше).
+  Первые TIMING.arm мс после запуска скрипта фокус и видимость «прыгают» (на Mac страница
+  грузится скрытой и через 30–90 мс становится видимой). Уход фокуса в это время не считается
+  вовсе: если фокус так и не вернётся, окно останется открытым, как раньше. Скрытие в это время
+  перепроверяется на границе arm: окно мигнуло и снова видно — живёт, всё ещё скрыто — закрывается.
+  Известные риски закрыть окно у читающего: фокус ушёл на шапку окна или в меню ⋮ после клика
+  в страницу и не вернулся за TIMING.grace; быстрый Cmd-Tab туда и обратно без клика в страницу
+  (выглядит как старое окно на новой кнопке). По замеру на Mac blur без hidden не приходил,
+  на других клиентах не замерено. «Перезагрузить» из меню окна — pagehide, окно закрывается.
   Журнал событий для проверки на живом клиенте — параметр trace=1 в адресе: события с
   временем, фокус, касания, платформа и версия клиента внизу страницы, последние 30 показов
   (они в localStorage), свежие сверху. trace=1&hold=1 без d — окно журнала: оно само не
@@ -71,6 +78,7 @@
   .t-bad { color: var(--bad); font-weight: 600; }
   .t-warn { color: var(--warn); font-weight: 600; }
   .t-info { color: var(--info); font-weight: 600; }
+  .t-buyer { color: var(--info); }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--tg-theme-bg-color, var(--bg)); color: var(--tg-theme-text-color, var(--fg));
          font: 15px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; overflow-wrap: anywhere; }
@@ -183,6 +191,11 @@ const TONES = [
   [new RegExp(`(?:недозвон|автоответчик)${RU}:?\\s+${NUM}%?(?:\\s+из\\s+\\d+)?`, "i"), whole("warn")],
   [/(?:недозвон|автоответчик)[а-яё]*:/i, whole("warn")],
   [new RegExp(`в обработке\\s+${NUM}`, "i"), whole("info")],
+  // баеры (team_bot/buyers.text): «баеры sub2: mpolyakov (8), DERGOGLO (1) +1» — синим без
+  // жирного только ID баеров, чтобы их было видно в длинной строке стопа; «баеры sub2:», число
+  // лидов в скобках и «+N» — без цвета. Жирный синий — «в обработке», его не путаем.
+  [/(баер(?:ы)?\s+sub\d+:\s*)([^\s,()]+(?:\s\(\d+\))?(?:,\s*[^\s,()]+(?:\s\(\d+\))?)*)/i,
+   (m) => [[m[1], null], ...m[2].split(/(,\s*|\s\(\d+\))/).map((t) => [t, /^(?:,|\s\()/.test(t) ? null : "buyer"])]],
   // поток лидов: «42 лида против 19», «8 против 46» — только своё число
   [new RegExp(`(${NUM})(\\s+(?:лид${RU}\\s+)?(?:против|при)\\s+${NUM})(?!\\s*%|[\\d.,])`, "i"),
    (m) => [[m[1], num(m[1]) >= num(m[2].match(/[\d.,]+$/)[0]) ? "good" : "bad"], [m[2], null]]],
@@ -352,9 +365,11 @@ async function main() {
   const param = qp.get("d") || hp.get("d");
   if (!param && TRACE) return say("Окно журнала: ниже — что окна сводки получали от Telegram.");
   if (!param) return say("В ссылке нет сводки. Нажми кнопку «Открыть сводку» в чате ещё раз.", "err");
-  posId = hashOf(param);
   try {
-    render(await window.__unpack.unpack(param));
+    const text = await window.__unpack.unpack(param);
+    if (retired) return;                     // окно закрылось, пока распаковывали: не рисовать
+    render(text);
+    posId = hashOf(param);                   // ключ места — после разбора: раньше savePos записал бы y=0
   } catch (e) {
     console.error(e);                        // причина — в консоль, менеджеру она ни к чему
     return say("Сводка не открылась: ссылка повреждена. Нажми кнопку в чате ещё раз; " +
@@ -369,7 +384,9 @@ async function main() {
 // Задержки, мс: grace — сколько окно может быть без фокуса (клик по шапке окна, меню ⋮);
 // input — касание страницы рядом с возвратом фокуса: было — менеджер вернулся сам, не было —
 // Telegram вывел старое окно на новой кнопке; stale — сколько видна надпись перед закрытием;
-// arm — первые мс после открытия фокус «прыгает», возврат фокуса тогда не проверяем.
+// arm — первые мс после запуска скрипта страницы фокус «прыгает», возврат фокуса тогда не
+// проверяем. Отсчёт от запуска скрипта (T0), а не от начала загрузки: на медленной сети загрузка
+// сама съела бы эти 1,5 с.
 const TIMING = Object.assign({ grace: 800, input: 400, stale: 1500, arm: 1500 }, window.__digestTiming || {});
 const STALE = "Это окно уже закрыто. Нажми кнопку в чате ещё раз.";
 const POS_KEY = "digest-pos", POS_DAYS = 3, POS_KEEP = 20;
@@ -380,6 +397,8 @@ const HOLD = TRACE && QP.get("hold") === "1";   // окно-журнал: «за
 const DETAILS = [];                          // {id, det} разделов — для места чтения
 let retired = false, closing = false, awayAt = 0, graceTimer = 0, lastInput = -1e9, posId = "", scrollTimer = 0;
 const ms = () => (window.performance && performance.now ? performance.now() : Date.now());
+const T0 = ms();
+const sinceStart = () => ms() - T0;
 const onPhone = () => !!(tg && /^(ios|android)/.test(tg.platform || ""));
 const focused = () => !!(document.hasFocus && document.hasFocus());
 
@@ -464,7 +483,7 @@ function onBlur() {
   if (!inTelegram() || onPhone() || retired) return;
   // Фокус «прыгает» при открытии: такой уход не считаем, иначе окно закрылось бы, едва открывшись.
   // Если фокус так и не вернётся, окно останется открытым, как было до этой правки.
-  if (ms() < TIMING.arm) return trace("blur при открытии — не считаю");
+  if (sinceStart() < TIMING.arm) return trace("blur при открытии — не считаю");
   awayAt = ms();
   clearTimeout(graceTimer);
   graceTimer = setTimeout(() => {
@@ -480,7 +499,7 @@ function onFocus() {
   const at = ms(), away = at - awayAt;
   awayAt = 0;
   clearTimeout(graceTimer);
-  if (at < TIMING.arm) return;               // фокус ещё устраивается после открытия
+  if (at - T0 < TIMING.arm) return;          // фокус ещё устраивается после открытия
   if (away > TIMING.grace) return shownAgain("фокус после ухода");   // таймер придержали в фоне
   setTimeout(() => { if (!retired && lastInput < at - TIMING.input) shownAgain("фокус без касания"); }, TIMING.input);
 }
@@ -489,7 +508,7 @@ function onVisibility() {
   if (document.visibilityState !== "hidden") return;
   if (onPhone()) return savePos();           // другое приложение: вернёшься в это же окно
   // При открытии окно может мигнуть hidden → visible: закрываем, только если скрыто и после arm.
-  const wait = TIMING.arm - ms();
+  const wait = TIMING.arm - sinceStart();
   if (wait > 0) return setTimeout(() => { if (document.visibilityState === "hidden") retire("окно скрыто"); }, wait);
   retire("окно скрыто");
 }
